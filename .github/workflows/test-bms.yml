@@ -1,0 +1,44 @@
+name: Test BookMyShow Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      event_code:
+        description: "Event code"
+        required: true
+        default: "ET00523959"
+        type: string
+
+      target_date:
+        description: "Target date in YYYYMMDD format"
+        required: true
+        default: "20261128"
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test BookMyShow URL
+        shell: bash
+        run: |
+          URL="https://in.bookmyshow.com/movies/coimbatore/ramayana/buytickets/${{ inputs.event_code }}/${{ inputs.target_date }}?etCodes=${{ inputs.event_code }}&language=tamil&refEventCode=${{ inputs.event_code }}"
+
+          echo "Requested URL:"
+          echo "$URL"
+          echo
+
+          curl \
+            --silent \
+            --show-error \
+            --location \
+            --output response.html \
+            --write-out "HTTP_STATUS=%{http_code}\nFINAL_URL=%{url_effective}\nCONTENT_TYPE=%{content_type}\n" \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36" \
+            "$URL"
+
+          echo
+          echo "Response preview:"
+          head -c 1000 response.html
+          echo
