@@ -1,0 +1,191 @@
+name: BookMyShow Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      event_code:
+        description: "BookMyShow event code, for example ET00523959"
+        required: true
+        type: string
+
+      target_date:
+        description: "Show date in YYYYMMDD format, for example 20261128"
+        required: true
+        type: string
+
+      stop_after_date:
+        description: "Stop monitoring after this date, in YYYYMMDD format"
+        required: true
+        type: string
+
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bookmyshow-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Activate monitor from manual input
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          cat > monitor.json <<EOF
+          {
+            "event_code": "${{ inputs.event_code }}",
+            "target_date": "${{ inputs.target_date }}",
+            "stop_after_date": "${{ inputs.stop_after_date }}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add monitor.json
+          git commit -m "Activate BookMyShow monitor" || true
+          git push
+
+      - name: Check whether a monitor is active
+        id: active
+        shell: bash
+        run: |
+          if [ -f monitor.json ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "No active monitor. Nothing to check."
+          fi
+
+      - name: Read monitor configuration
+        if: steps.active.outputs.active == 'true'
+        id: config
+        shell: bash
+        run: |
+          EVENT_CODE=$(jq -r '.event_code' monitor.json)
+          TARGET_DATE=$(jq -r '.target_date' monitor.json)
+          STOP_AFTER_DATE=$(jq -r '.stop_after_date' monitor.json)
+
+          echo "event_code=$EVENT_CODE" >> "$GITHUB_OUTPUT"
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+          echo "stop_after_date=$STOP_AFTER_DATE" >> "$GITHUB_OUTPUT"
+
+          echo "Event code: $EVENT_CODE"
+          echo "Target date: $TARGET_DATE"
+          echo "Stop after: $STOP_AFTER_DATE"
+
+      - name: Check expiry date
+        if: steps.active.outputs.active == 'true'
+        id: expiry
+        shell: bash
+        run: |
+          TODAY=$(TZ=Asia/Kolkata date +%Y%m%d)
+          STOP_AFTER="${{ steps.config.outputs.stop_after_date }}"
+
+          if [[ "$TODAY" > "$STOP_AFTER" ]]; then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            echo "Monitor expired on $STOP_AFTER."
+          else
+            echo "expired=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Disable expired monitor
+        if: steps.active.outputs.active == 'true' && steps.expiry.outputs.expired == 'true'
+        shell: bash
+        run: |
+          rm -f monitor.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Disable expired BookMyShow monitor" || true
+          git push
+
+      - name: Set up Python
+        if: steps.active.outputs.active == 'true' && steps.expiry.outputs.expired == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        if: steps.active.outputs.active == 'true' && steps.expiry.outputs.expired == 'false'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Check BookMyShow
+        if: steps.active.outputs.active == 'true' && steps.expiry.outputs.expired == 'false'
+        id: booking
+        shell: bash
+        run: |
+          set +e
+
+          python bms_monitor.py \
+            "${{ steps.config.outputs.event_code }}" \
+            "${{ steps.config.outputs.target_date }}"
+
+          RESULT=$?
+
+          if [ "$RESULT" -eq 0 ]; then
+            echo "open=true" >> "$GITHUB_OUTPUT"
+            echo "Booking detected."
+          elif [ "$RESULT" -eq 1 ]; then
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            echo "Booking is not open yet."
+          else
+            echo "open=error" >> "$GITHUB_OUTPUT"
+            echo "BookMyShow check failed."
+          fi
+
+          exit 0
+
+      - name: Send Telegram notification
+        if: steps.booking.outputs.open == 'true'
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          URL="https://in.bookmyshow.com/movies/coimbatore/ramayana/buytickets/${{ steps.config.outputs.event_code }}/${{ steps.config.outputs.target_date }}?etCodes=${{ steps.config.outputs.event_code }}&language=tamil&refEventCode=${{ steps.config.outputs.event_code }}"
+
+          MESSAGE="BOOKING MAY BE OPEN!
+
+          Event: ${{ steps.config.outputs.event_code }}
+          Date: ${{ steps.config.outputs.target_date }}
+
+          Book now:
+          $URL"
+
+          curl --fail --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
+
+      - name: Disable monitor after booking is found
+        if: steps.booking.outputs.open == 'true'
+        shell: bash
+        run: |
+          rm -f monitor.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Disable completed BookMyShow monitor" || true
+          git push
